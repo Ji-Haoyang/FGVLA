@@ -139,7 +139,7 @@ class CreateDataset(object):
                                                   transforms.ToTensor(), self.normalize])
 
         self.train_dataset = RETrainDataset(config.train_file, self.train_transform, config.image_root)
-        self.test_dataset = REEvalDataset(config.test_file, self.test_transform, config.image_root) #返回一张图片和它的索引，文本描述可以通过索引单独访问
+        self.test_dataset = REEvalDataset(config.test_file, self.test_transform, config.image_root) 
         self.val_dataset = REEvalDataset(config.val_file, self.test_transform, config.image_root)
 
         self.train_loader = DataLoader(self.train_dataset, batch_size=config.batch_size_train,
@@ -214,13 +214,7 @@ class RSITRBaseline(nn.Module):
 
     
     def get_fine_grained_loss(self, patch_feats, noun_feats_list, temperature=0.07, pool_type='mean'):
-        """Calculate fine-grained loss, combining contrastive learning and mask prediction
-        Args:
-            patch_feats: [B, N, D] Patch features 
-            noun_feats_list: list of [num_nouns, D] List of noun features corresponding to each sample
-            temperature: Temperature coefficient
-            pool_type: Aggregation method, options are ['mean', 'max', 'attention', 'weighted', 'topk_mean']
-        """
+
         B, N, D = patch_feats.shape
         device = patch_feats.device
         H = W = int(N**0.5)
@@ -288,7 +282,7 @@ class RSITRBaseline(nn.Module):
         contrast_loss = torch.mean(torch.stack(contrast_losses))
         mask_loss = torch.mean(torch.stack(mask_losses))
         
-        # Adjust the weights of the two losses  # Only change this for fine-grained loss weights
+        # Adjust the weights of the two losses 
         lambda_contrast = 0.6
         lambda_mask = 0.4
         total_loss = lambda_contrast * contrast_loss + lambda_mask * mask_loss
@@ -441,107 +435,220 @@ class Runner(object):
         Tools.print(f"Start evaluating test_result={test_result}")
         return test_result
     
+    @torch.no_grad() 
+    def batched_aggregate_similarity(self, patch_noun_sim_batch, method='mean', mask=None, temperature=0.07, top_k=5):
+        B, num_X, num_Y = patch_noun_sim_batch.shape
+        
+        if num_X == 0 or num_Y == 0:
+            return torch.zeros(B, device=patch_noun_sim_batch.device, dtype=patch_noun_sim_batch.dtype)
+
+        processed_sim_batch = patch_noun_sim_batch 
+        
+        if mask is not None:
+            expanded_mask = mask.unsqueeze(1).expand(-1, num_X, -1)
+            processed_sim_batch = processed_sim_batch.masked_fill(~expanded_mask, -1e9)
+        patch_noun_sim_flat = processed_sim_batch.reshape(B, -1)
+
+        
+        flat_mask = None
+        if mask is not None:
+            flat_mask = expanded_mask.reshape(B, -1)
+        if method == 'max':
+            return torch.max(patch_noun_sim_flat, dim=1)[0]
+        
+        elif method == 'mean':
+            if mask is not None:
+                masked_sims = patch_noun_sim_batch.masked_fill(~expanded_mask, 0)
+                sum_of_sims = masked_sims.sum(dim=(-1,-2)) 
+                num_valid_elements_per_matrix = expanded_mask.sum(dim=(-1,-2))
+                num_valid_elements_per_matrix = num_valid_elements_per_matrix.clamp(min=1)
+                return sum_of_sims / num_valid_elements_per_matrix
+            else:
+                return torch.mean(patch_noun_sim_flat, dim=1)
+        
+
+        return torch.max(patch_noun_sim_flat, dim=1)[0]
+
+    
     @torch.no_grad()
     def evaluation(self, data_loader):
         self.model.eval()
-        alpha = 0.9  # Weight for coarse and fine-grained similarity
+        device = next(self.model.parameters()).device 
+        alpha = 0.9
 
-        def aggregate_similarity(patch_noun_sim, method='topk_mean', temperature=0.07, top_k=5):
-            """Aggregate the similarity matrix between patches and nouns
-            Args:
-                patch_noun_sim: [num_nouns/num_patches, num_patches/num_nouns] Similarity matrix
-                method: Aggregation method
-                temperature: Temperature coefficient
-                top_k: Number of top-k values to take
-            """
-            if method == 'max':
-                return torch.max(patch_noun_sim)
+        # Inference image features
+        image_patch_embeds_list = []
+        image_global_embeds_list = []
+        for image, _ in data_loader:
+            patch_embed, global_embed = self.model.get_vis_emb(image.to(device))
+            if patch_embed is not None:
+                 image_patch_embeds_list.append(patch_embed)
+            image_global_embeds_list.append(global_embed)
         
-            elif method == 'mean':
-                return torch.mean(patch_noun_sim)
-            
-
-        # Inference img features
-        image_patch_embeds = []
-        image_global_embeds = []
-        for image, img_id in data_loader:
-            patch_embed, global_embed = self.model.get_vis_emb(image.to(self.device))
-            image_patch_embeds.append(patch_embed)
-            image_global_embeds.append(global_embed)
+        if image_patch_embeds_list:
+            image_patch_embeds = torch.cat(image_patch_embeds_list, dim=0)
+        else:
+            image_patch_embeds = None
+        image_global_embeds = torch.cat(image_global_embeds_list, dim=0)
+        N_img = image_global_embeds.shape[0]
 
         # Inference text features
         text_word_embeds = []
         text_global_embeds = []
-        text_nouns_indices = []  # Store the positions of nouns in each sentence
+        text_nouns_indices = []  
+        text_nouns_features_list = []  
         texts = data_loader.dataset.text
         num_text = len(texts)
         text_bs = config.batch_size_test_text
-    
+
         for i in range(0, num_text, text_bs):
             text_batch = texts[i: min(num_text, i + text_bs)]
-        
-            # Get text features
+
+            
             text_input = self.tokenize(text_batch).to(self.device)
             word_embed, global_embed = self.model.get_txt_emb(text_input, return_word_feats=True)
-        
-            # Extract the positions of nouns in each sentence
-            noun_indices = []
-            for text in text_batch:
-                nouns = self.extract_nouns(text)
-                indices = [j for j, word in enumerate(text.split()) if word in nouns]
-                noun_indices.append(indices if indices else [0])  # If no nouns, use the first token
+
             
+            noun_indices = []
+            for j, text in enumerate(text_batch):
+                nouns = self.model.extract_nouns(text) 
+                indices = [k for k, word in enumerate(text.split()) if word in nouns]
+                noun_indices.append(indices if indices else [0]) 
+        
+               
+                batch_idx = j
+                if indices:
+                    noun_feats = word_embed[batch_idx, indices] 
+                else:
+                    noun_feats = word_embed[batch_idx, :1]  
+                text_nouns_features_list.append(noun_feats)
+    
             text_word_embeds.append(word_embed)
             text_global_embeds.append(global_embed)
             text_nouns_indices.extend(noun_indices)
 
-        # Concatenate features
-        image_patch_embeds = torch.cat(image_patch_embeds, dim=0)   # [N_img, 49, D]
-        image_global_embeds = torch.cat(image_global_embeds, dim=0) # [N_img, D]
+      
+        image_patch_embeds = torch.cat(image_patch_embeds_list, dim=0)   # [N_img, 49, D]
+        image_global_embeds = torch.cat(image_global_embeds_list, dim=0) # [N_img, D]
         text_word_embeds = torch.cat(text_word_embeds, dim=0)       # [N_txt, 77, D]
-        text_global_embeds = torch.cat(text_global_embeds, dim=0)   # [N_txt, D]
+        text_global_embeds = torch.cat(text_global_embeds, dim=0) # [N_txt, D]
+        N_txt = text_global_embeds.shape[0]   
 
-        # 1. Calculate coarse-grained similarity
+ 
         sims_matrix_global = image_global_embeds @ text_global_embeds.t()  # [N_img, N_txt]
 
-        # 2. Calculate fine-grained similarity
-        sims_matrix_local_img2txt = torch.zeros_like(sims_matrix_global)  # [N_img, N_txt]
-        sims_matrix_local_txt2img = torch.zeros_like(sims_matrix_global)  # [N_img, N_txt]
 
-        # Set aggregation method
-        aggregate_method = 'mean'  # Different aggregation methods can be chosen
+        sims_matrix_local_img2txt = torch.zeros_like(sims_matrix_global, device=device)
+        sims_matrix_local_txt2img = torch.zeros_like(sims_matrix_global, device=device)
+        aggregate_method_for_fine_grained = 'mean' 
+        
+        if image_patch_embeds is not None and text_nouns_features_list:
+            # Part A: (Text queries -> Image database)
+            for txt_idx in range(N_txt):
+                current_text_all_noun_feats = text_nouns_features_list[txt_idx].to(device)
+                num_nouns_for_current_text = current_text_all_noun_feats.shape[0]
 
-        # Fine-grained similarity calculation when retrieving images from sentences  
-        for i in range(len(text_word_embeds)):  # Iterate over each text
-            txt_nouns = text_word_embeds[i, text_nouns_indices[i]]  # [num_nouns, D]
-            for j in range(len(image_patch_embeds)):  # Iterate over each image
-                img_patches = image_patch_embeds[j]  # [49, D]
-                patch_noun_sim = torch.matmul(txt_nouns, img_patches.t())  # [num_nouns, 49]
-                sims_matrix_local_txt2img[j, i] = aggregate_similarity(
-                    patch_noun_sim,
-                    method=aggregate_method,
-                    temperature=0.07,
-                    top_k=5
+                if num_nouns_for_current_text == 0:
+                    sims_matrix_local_txt2img[:, txt_idx] = 0.0
+                    continue
+                
+                batch_patch_noun_sim = torch.einsum('ipd,nd->ipn', image_patch_embeds, current_text_all_noun_feats)
+                aggregated_scores_for_this_text = self.batched_aggregate_similarity(
+                    batch_patch_noun_sim,
+                    method=aggregate_method_for_fine_grained,
+                    temperature=0.07, top_k=5
+                )
+                sims_matrix_local_txt2img[:, txt_idx] = aggregated_scores_for_this_text
+            # Part B: (Image queries -> Text database) -
+            max_nouns_in_batch = max([feats.shape[0] for feats in text_nouns_features_list]) if text_nouns_features_list else 0
+            
+            if max_nouns_in_batch > 0:
+                padded_text_noun_feats = torch.zeros(
+                    N_txt, max_nouns_in_batch, text_nouns_features_list[0].shape[-1], 
+                    device=device, dtype=text_nouns_features_list[0].dtype
+                )
+                noun_mask = torch.zeros(N_txt, max_nouns_in_batch, dtype=torch.bool, device=device)
+                for txt_idx, noun_feats in enumerate(text_nouns_features_list):
+                    num_nouns = noun_feats.shape[0]
+                    if num_nouns > 0:
+                        padded_text_noun_feats[txt_idx, :num_nouns, :] = noun_feats
+                        noun_mask[txt_idx, :num_nouns] = True 
+
+            
+                full_patch_noun_sim = torch.einsum(
+                    'ipd,tnd->iptn', image_patch_embeds, padded_text_noun_feats
                 )
 
-        # Fine-grained similarity calculation when retrieving sentences from images
-        for i in range(len(image_patch_embeds)):  # Iterate over each image
-            img_patches = image_patch_embeds[i]  # [49, D]
-            for j in range(len(text_word_embeds)):  # Iterate over each text
-                txt_nouns = text_word_embeds[j, text_nouns_indices[j]]  # [num_nouns, D]
-                patch_noun_sim = torch.matmul(img_patches, txt_nouns.t())  # [49, num_nouns]
-                sims_matrix_local_img2txt[i, j] = aggregate_similarity(
-                    patch_noun_sim,
-                    method=aggregate_method,
-                    temperature=0.07,
-                    top_k=5
+                full_patch_noun_sim_rearranged = full_patch_noun_sim.permute(0, 2, 1, 3) 
+                flat_batch_size = N_img * N_txt
+                sim_matrix_for_batch_agg = full_patch_noun_sim_rearranged.reshape(
+                    flat_batch_size, full_patch_noun_sim_rearranged.shape[2], full_patch_noun_sim_rearranged.shape[3]
                 )
 
-        # 3. Combine the two types of similarity
-        sims_matrix_txt2img = alpha * sims_matrix_global + (1-alpha) * sims_matrix_local_txt2img
-        sims_matrix_img2txt = alpha * sims_matrix_global + (1-alpha) * sims_matrix_local_img2txt
+                batch_noun_mask_expanded = noun_mask.unsqueeze(0).expand(N_img, -1, -1)
+                batch_noun_mask_flat = batch_noun_mask_expanded.reshape(flat_batch_size, max_nouns_in_batch)
+                aggregated_scores_flat = self.batched_aggregate_similarity(
+                    sim_matrix_for_batch_agg,
+                    method=aggregate_method_for_fine_grained,
+                    mask=batch_noun_mask_flat, # mask
+                    temperature=0.07, top_k=5
+                )
+                
+                #  [N_img, N_txt]
+                sims_matrix_local_img2txt = aggregated_scores_flat.reshape(N_img, N_txt)
 
-        return sims_matrix_img2txt.cpu().numpy(), sims_matrix_txt2img.t().cpu().numpy()
+            ''' if cuda out of memory, try to use this   
+            
+            max_nouns_in_batch = max([feats.shape[0] for feats in text_nouns_features_list]) if text_nouns_features_list else 0
+            
+            if max_nouns_in_batch > 0:
+                padded_text_noun_feats = torch.zeros(
+                    N_txt, max_nouns_in_batch, text_nouns_features_list[0].shape[-1], 
+                    device=device, dtype=text_nouns_features_list[0].dtype
+                )
+                noun_mask = torch.zeros(N_txt, max_nouns_in_batch, dtype=torch.bool, device=device)
+                for txt_idx, noun_feats in enumerate(text_nouns_features_list):
+                    num_nouns = noun_feats.shape[0]
+                    if num_nouns > 0:
+                        padded_text_noun_feats[txt_idx, :num_nouns, :] = noun_feats
+                        noun_mask[txt_idx, :num_nouns] = True
+                
+                image_chunk_size = 32 
+                
+                for i in range(0, N_img, image_chunk_size):
+                    image_patch_chunk = image_patch_embeds[i : i + image_chunk_size] # [chunk, Num_patches, D]
+                    chunk_patch_noun_sim = torch.einsum(
+                        'cpd,tnd->cptn', image_patch_chunk, padded_text_noun_feats
+                    )
+                    
+                    expanded_noun_mask = noun_mask.view(1, 1, N_txt, max_nouns_in_batch).expand(
+                        image_patch_chunk.shape[0], chunk_patch_noun_sim.shape[1], -1, -1
+                    )
+                    
+                    chunk_sim_rearranged = chunk_patch_noun_sim.permute(0, 2, 1, 3) # [chunk, N_txt, Num_patches, Max_nouns]
+                    flat_batch_size = chunk_sim_rearranged.shape[0] * chunk_sim_rearranged.shape[1]
+                    sim_matrix_for_agg = chunk_sim_rearranged.reshape(
+                        flat_batch_size, chunk_sim_rearranged.shape[2], chunk_sim_rearranged.shape[3]
+                    )
+
+                    batch_noun_mask_expanded = noun_mask.unsqueeze(0).expand(chunk_sim_rearranged.shape[0], -1, -1) # [chunk, N_txt, Max_nouns]
+                    batch_noun_mask_flat = batch_noun_mask_expanded.reshape(flat_batch_size, max_nouns_in_batch)
+
+                    aggregated_scores_flat = self.batched_aggregate_similarity(
+                        sim_matrix_for_agg,
+                        method=aggregate_method_for_fine_grained,
+                        mask=batch_noun_mask_flat
+                    )
+                
+                    sims_matrix_local_img2txt[i : i + image_chunk_size, :] = aggregated_scores_flat.reshape(
+                        chunk_sim_rearranged.shape[0], chunk_sim_rearranged.shape[1]
+                    )
+            '''
+
+        final_sims_for_t2i = alpha * sims_matrix_global + (1 - alpha) * sims_matrix_local_txt2img
+        final_sims_for_i2t = alpha * sims_matrix_global + (1 - alpha) * sims_matrix_local_img2txt
+
+        return final_sims_for_i2t.cpu().numpy(), final_sims_for_t2i.t().cpu().numpy()
     
     
     def extract_nouns(self, text):
@@ -723,7 +830,24 @@ class Config_RSICD_ViT(ConfigCommon):
 
     pass
 
+class Config_UCM_Caption_ViT(ConfigCommon):
 
+    def __init__(self):
+        super().__init__() 
+
+        self.output_dir = Tools.new_dir("./outputs/test_UCM_ViT") 
+        self.log_filename = os.path.join(self.output_dir, 
+                                         datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-log.txt"))
+        self.model = 'vit' 
+        self.image_root = '/root/ucm-caption/imgs'
+        converted_json_dir = './data/finetune/' 
+        self.train_file = [os.path.join(converted_json_dir, 'ucm_caption_train_converted.json')]
+        self.val_file = os.path.join(converted_json_dir, 'ucm_caption_val_converted.json')
+        self.test_file = os.path.join(converted_json_dir, 'ucm_caption_test_converted.json')
+    
+        pass 
+
+    pass 
 
 
 
@@ -731,7 +855,7 @@ class Config_RSICD_ViT(ConfigCommon):
 if __name__ == '__main__':
 
     result_list = []
-    # for ConfigCLS in [Config_RSITMD_ViT, Config_RSICD_ViT]:
+    # for ConfigCLS in [Config_RSITMD_ViT, Config_RSICD_ViT, Config_UCM_Caption_ViT]:
     for ConfigCLS in [Config_RSITMD_ViT]:
         config = ConfigCLS()
         runner = Runner()
